@@ -4,14 +4,14 @@
   <table>
     <tr>
       <td width="50%" align="center">
-        <img src="media/demo.gif" alt="Closed-loop demo animation" width="100%">
+        <img src="media/dev.gif" alt="Closed-loop demo animation" width="100%">
         <br>
         <em>Real-time closed-loop response demonstration</em>
       </td>
       <td width="50%" align="center">
-        <img src="media/system_overview.png" alt="System overview" width="100%">
+        <img src="media/IMG_9176.jpg" alt="System overview" width="100%">
         <br><br>
-        <img src="media/hardware_setup.png" alt="Hardware setup" width="100%">
+        <img src="media/IMG_9177.jpg" alt="Hardware setup" width="100%">
         <br>
         <em>System architecture and hardware implementation</em>
       </td>
