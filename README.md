@@ -29,11 +29,20 @@ The design emphasizes **deterministic timing, physical feedback, and minimal sof
 
 ---
 
+## Demonstration Behavior
+The included demo intentionally uses a **human finger as a physical obstruction** to visualize collision and resistance detection.  
+Only a **very small amount of opposing force** is required for the controller to recognize that commanded motion no longer matches measured encoder movement.  
+Once this mismatch is detected, the system reacts immediately, demonstrating how even minimal resistance or contact with an external object can be identified reliably and in real time.
+
+This showcases how the controller could be extended to detect collisions, soft end-stops, or human interaction in robotic or mechatronic systems.
+
+---
+
 ## Functionality
 - STEP/DIR-based stepper motor control  
 - High-resolution absolute position feedback via magnetic encoder  
 - Real-time comparison of expected vs. measured motion  
-- Stall and resistance detection through motion deviation  
+- Detection of stalls, resistance, and physical obstructions  
 - Immediate corrective response without PID or FOC  
 - UART-free runtime operation for timing consistency  
 
@@ -65,6 +74,6 @@ The design emphasizes **deterministic timing, physical feedback, and minimal sof
 
 ## Applications
 - Closed-loop stepper motor research  
-- Stall and force interaction detection  
+- Collision and force-interaction detection  
 - Robotic joints and actuators  
 - Embedded motor-control education and prototyping  
