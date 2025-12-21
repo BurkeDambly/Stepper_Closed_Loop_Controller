@@ -1,260 +1,345 @@
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32g4xx_hal.h"
+#include "core_cm4.h"
+#include <stdint.h>
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
+// ================= STEP / DIR =================
+#define STEP_PORT GPIOA
+#define STEP_PIN  GPIO_PIN_8   // PA8
+#define DIR_PORT  GPIOB
+#define DIR_PIN   GPIO_PIN_7   // PB7
 
-/* USER CODE END Includes */
+// ================= ENCODER PWM (AS5048A) =================
+// Yellow (P) -> PB6
+#define ENC_PWM_PORT GPIOB
+#define ENC_PWM_PIN  GPIO_PIN_6
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
+// ================= SPEED =================
+#define HIGH_US        4
+#define LOW_US         400   // bigger = slower
 
-/* USER CODE END PTD */
+// ================= ENCODER / LOOP =================
+#define ENC_COUNTS_PER_REV       16384
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
+// --- YOU TUNE THIS ---
+// counts_per_step = COUNTS_PER_STEP_Q16 / 65536
+// Start guess: 8 counts/step (adjust later)
+#define COUNTS_PER_STEP_Q16      (8 << 16)
 
-/* USER CODE END PD */
+// How often we evaluate lag
+#define CHECK_MS                 10
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
+// Only evaluate if we stepped enough in the window
+#define MIN_STEPS_IN_WINDOW      15
 
-/* USER CODE END PM */
+// Consider "lagging" if expected - actual exceeds this
+#define LAG_THRESH_COUNTS        15     // lower = more sensitive (try 20..120)
 
-/* Private variables ---------------------------------------------------------*/
+// Require lag for N consecutive windows before flipping (prevents chatter)
+#define LAG_CONSEC_WINDOWS       3      // 1 = fastest, 2–3 = more stable
 
-COM_InitTypeDef BspCOMInit;
+// Cooldown after flip (prevents immediate flip-back)
+#define COOLDOWN_MS              250
 
-/* USER CODE BEGIN PV */
+// Encoder PWM sanity
+#define ENCODER_MIN_PERIOD_US    50
+#define ENCODER_MAX_PERIOD_US 50000
 
-/* USER CODE END PV */
+// ================= UART (TMC2209) =================
+UART_HandleTypeDef huart1;
 
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
+// ---------------- prototypes ----------------
+static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-/* USER CODE BEGIN PFP */
+static void MX_USART1_UART_Init(void);
+void Error_Handler(void);
 
-/* USER CODE END PFP */
+// ================= DWT =================
+static void dwt_init(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
 
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
+static inline uint32_t micros(void)
+{
+  return DWT->CYCCNT / (HAL_RCC_GetHCLKFreq() / 1000000U);
+}
 
-/* USER CODE END 0 */
+static void delay_us(uint32_t us)
+{
+  uint32_t start  = DWT->CYCCNT;
+  uint32_t cycles = us * (HAL_RCC_GetHCLKFreq() / 1000000U);
+  while ((DWT->CYCCNT - start) < cycles) {}
+}
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
+// ================= TMC2209 (write-only) =================
+static uint8_t tmc_crc8(const uint8_t *data, int len)
+{
+  uint8_t crc = 0;
+  for (int i = 0; i < len; i++) {
+    uint8_t d = data[i];
+    for (int b = 0; b < 8; b++) {
+      uint8_t mix = (crc ^ d) & 1;
+      crc >>= 1;
+      if (mix) crc ^= 0x8C;
+      d >>= 1;
+    }
+  }
+  return crc;
+}
+
+static void tmc_write(uint8_t reg, uint32_t val)
+{
+  uint8_t b[8];
+  b[0]=0x05; b[1]=0x00; b[2]=reg|0x80;
+  b[3]=val>>24; b[4]=val>>16; b[5]=val>>8; b[6]=val;
+  b[7]=tmc_crc8(b,7);
+  HAL_UART_Transmit(&huart1, b, 8, HAL_MAX_DELAY);
+}
+
+// ================= Encoder PWM capture (EXTI) =================
+// Stable angle update only on rising edges
+static volatile uint32_t g_rise_us   = 0;
+static volatile uint32_t g_period_us = 0;
+static volatile uint32_t g_high_us   = 0;
+
+static volatile uint16_t g_angle_counts = 0;
+static volatile uint8_t  g_angle_valid  = 0;
+
+static inline void encoder_update_angle_from_pwm(uint32_t period_us, uint32_t high_us)
+{
+  if (period_us < ENCODER_MIN_PERIOD_US || period_us > ENCODER_MAX_PERIOD_US) return;
+  if (high_us == 0 || high_us >= period_us) return;
+
+  uint32_t x = (high_us * ENC_COUNTS_PER_REV) / period_us;
+  if (x >= ENC_COUNTS_PER_REV) x = ENC_COUNTS_PER_REV - 1;
+
+  g_angle_counts = (uint16_t)x;
+  g_angle_valid = 1;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t pin)
+{
+  if (pin != ENC_PWM_PIN) return;
+
+  uint32_t now = micros();
+
+  if (HAL_GPIO_ReadPin(ENC_PWM_PORT, ENC_PWM_PIN) == GPIO_PIN_SET)
+  {
+    // Rising edge
+    if (g_rise_us) {
+      g_period_us = now - g_rise_us;
+      encoder_update_angle_from_pwm(g_period_us, g_high_us);
+    }
+    g_rise_us = now;
+  }
+  else
+  {
+    // Falling edge
+    g_high_us = now - g_rise_us;
+  }
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(ENC_PWM_PIN);
+}
+
+// Signed smallest delta a-b in counts: [-8192..+8191]
+static inline int16_t wrap_delta_signed(uint16_t a, uint16_t b)
+{
+  int32_t d = (int32_t)a - (int32_t)b;
+  d %= ENC_COUNTS_PER_REV;
+  if (d < 0) d += ENC_COUNTS_PER_REV;
+  if (d > (ENC_COUNTS_PER_REV / 2)) d -= ENC_COUNTS_PER_REV;
+  return (int16_t)d;
+}
+
+// ================= Stepping =================
+static inline void step_once(void)
+{
+  HAL_GPIO_WritePin(STEP_PORT, STEP_PIN, GPIO_PIN_SET);
+  delay_us(HIGH_US);
+  HAL_GPIO_WritePin(STEP_PORT, STEP_PIN, GPIO_PIN_RESET);
+  delay_us(LOW_US);
+}
+
+// ================= MAIN =================
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  /* USER CODE BEGIN 2 */
+  MX_USART1_UART_Init();
+  dwt_init();
 
-  /* USER CODE END 2 */
+  // TMC2209 setup (same as your working config)
+  tmc_write(0x10, (16U<<0) | (31U<<8) | (6U<<16));
+  tmc_write(0x00, (1U<<2));
 
-  /* Initialize leds */
-  BSP_LED_Init(LED_GREEN);
+  HAL_Delay(150);
 
-  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
-  BspCOMInit.BaudRate   = 115200;
-  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
-  BspCOMInit.StopBits   = COM_STOPBITS_1;
-  BspCOMInit.Parity     = COM_PARITY_NONE;
-  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
-  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
-  {
-    Error_Handler();
-  }
+  // Direction: +1 forward, -1 reverse
+  int dir = +1;
+  HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, GPIO_PIN_SET);
 
-  /* USER CODE BEGIN BSP */
+  // Window state
+  uint32_t win_start_ms = HAL_GetTick();
+  uint32_t steps_in_win = 0;
 
-  /* -- Sample board code to send message over COM1 port ---- */
-  printf("Welcome to STM32 world !\n\r");
+  uint16_t angle_start = 0;
+  uint8_t  angle_start_valid = 0;
 
-  /* -- Sample board code to switch on leds ---- */
-  BSP_LED_On(LED_GREEN);
+  uint32_t cooldown_until_ms = 0;
+  uint8_t lag_windows = 0;
 
-  /* USER CODE END BSP */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
+    step_once();
+    steps_in_win++;
 
-/* -- Sample board code to toggle leds ---- */
-       BSP_LED_Toggle(LED_GREEN);
-       HAL_Delay(500);
-    /* USER CODE END WHILE */
+    uint32_t now_ms = HAL_GetTick();
+    if ((now_ms - win_start_ms) >= CHECK_MS)
+    {
+      uint16_t angle_now = g_angle_counts;
+      uint8_t  angle_now_valid = g_angle_valid;
 
-    /* USER CODE BEGIN 3 */
+      // Seed start sample
+      if (!angle_start_valid && angle_now_valid) {
+        angle_start = angle_now;
+        angle_start_valid = 1;
+      }
+
+      if (angle_start_valid && angle_now_valid && steps_in_win >= MIN_STEPS_IN_WINDOW)
+      {
+        // Actual signed motion in counts this window
+        int16_t d_counts = wrap_delta_signed(angle_now, angle_start);
+
+        // Project motion onto the commanded direction (so opposite sign doesn't confuse us)
+        int32_t actual_in_dir = (dir > 0) ? (int32_t)d_counts : (int32_t)(-d_counts);
+        if (actual_in_dir < 0) actual_in_dir = 0; // if it moved backwards, treat as 0 progress
+
+        // Expected motion (counts) this window
+        int32_t expected = (int32_t)(((int64_t)steps_in_win * (int64_t)COUNTS_PER_STEP_Q16) >> 16);
+
+        int32_t lag = expected - actual_in_dir; // positive lag = falling behind
+
+        if (now_ms < cooldown_until_ms) {
+          lag_windows = 0; // ignore during cooldown
+        } else {
+          if (lag > LAG_THRESH_COUNTS) {
+            if (lag_windows < 255) lag_windows++;
+          } else {
+            lag_windows = 0;
+          }
+
+          if (lag_windows >= LAG_CONSEC_WINDOWS) {
+            dir = -dir;
+            HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, (dir > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+            cooldown_until_ms = now_ms + COOLDOWN_MS;
+            lag_windows = 0;
+          }
+        }
+      }
+
+      // Reset window
+      win_start_ms = now_ms;
+      steps_in_win = 0;
+
+      if (angle_now_valid) {
+        angle_start = angle_now;
+        angle_start_valid = 1;
+      } else {
+        angle_start_valid = 0;
+      }
+    }
   }
-  /* USER CODE END 3 */
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
+// ================= INIT =================
+static void MX_USART1_UART_Init(void)
 {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  __HAL_RCC_USART1_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /** Configure the main internal regulator output voltage
-  */
-  HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
+  GPIO_InitTypeDef g={0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
-  RCC_OscInitStruct.PLL.PLLN = 85;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  // PA9 = USART1_TX (TMC2209)
+  g.Pin = GPIO_PIN_9;
+  g.Mode = GPIO_MODE_AF_PP;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_HIGH;
+  g.Alternate = GPIO_AF7_USART1;
+  HAL_GPIO_Init(GPIOA, &g);
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_GPIO_Init(void)
 {
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
+  GPIO_InitTypeDef g={0};
 
-  /* USER CODE END MX_GPIO_Init_2 */
+  // STEP PA8
+  g.Pin = STEP_PIN;
+  g.Mode = GPIO_MODE_OUTPUT_PP;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(STEP_PORT, &g);
+
+  // DIR PB7
+  g.Pin = DIR_PIN;
+  g.Mode = GPIO_MODE_OUTPUT_PP;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(DIR_PORT, &g);
+
+  // Encoder PWM PB6 EXTI both edges
+  g.Pin = ENC_PWM_PIN;
+  g.Mode = GPIO_MODE_IT_RISING_FALLING;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(ENC_PWM_PORT, &g);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+  HAL_GPIO_WritePin(STEP_PORT, STEP_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(DIR_PORT, DIR_PIN, GPIO_PIN_RESET);
 }
 
-/* USER CODE BEGIN 4 */
+static void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef o={0};
+  RCC_ClkInitTypeDef c={0};
 
-/* USER CODE END 4 */
+  o.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  o.HSIState = RCC_HSI_ON;
+  o.PLL.PLLState = RCC_PLL_OFF;
+  if (HAL_RCC_OscConfig(&o) != HAL_OK) Error_Handler();
 
-/* USER CODE BEGIN Header */
-/**
-  ******************************************************************************
-  * File Name          :
-  * Description        :
-  ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2025 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
-  ******************************************************************************
-  */
-/* USER CODE END Header */
+  c.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK;
+  c.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
+  c.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  if (HAL_RCC_ClockConfig(&c, FLASH_LATENCY_0) != HAL_OK) Error_Handler();
+}
 
-/**
-  * @}
-  */
-
-/**
-  * @}
-  */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+  while (1) {}
 }
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
