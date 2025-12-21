@@ -9,9 +9,9 @@
         <em>Real-time closed-loop response demonstration</em>
       </td>
       <td width="50%" align="center">
-        <img src="media/IMG_9176.jpg" alt="System overview" width="100%">
+        <img src="media/IMG_9176.jpg" alt="System overview" width="50%">
         <br><br>
-        <img src="media/IMG_9177.jpg" alt="Hardware setup" width="100%">
+        <img src="media/IMG_9177.jpg" alt="Hardware setup" width="50%">
         <br>
         <em>System architecture and hardware implementation</em>
       </td>
